@@ -1,0 +1,7 @@
+# ninja log v5
+0	9529	1746433518478720240	/home/hyunjoon/joonkyu/feature-lifting/submodules/simple-knn/build/temp.linux-x86_64-cpython-39/simple_knn.o	6d35ffc4731d1f75
+0	14516	1746433523466753050	/home/hyunjoon/joonkyu/feature-lifting/submodules/simple-knn/build/temp.linux-x86_64-cpython-39/ext.o	758813886505b3e7
+0	49250	1746433558178972164	/home/hyunjoon/joonkyu/feature-lifting/submodules/simple-knn/build/temp.linux-x86_64-cpython-39/spatial.o	d85fa28769a6fb43
+0	11014	1759853779919885088	/home/hyunjoon/data0/hyunjoon/workspace/joonkyu/CF3/submodules/simple-knn/build/temp.linux-x86_64-cpython-39/simple_knn.o	4eccc20edf437995
+0	19175	1759853788099819129	/home/hyunjoon/data0/hyunjoon/workspace/joonkyu/CF3/submodules/simple-knn/build/temp.linux-x86_64-cpython-39/ext.o	dc45a0411c6d98ae
+0	55534	1759853824419533231	/home/hyunjoon/data0/hyunjoon/workspace/joonkyu/CF3/submodules/simple-knn/build/temp.linux-x86_64-cpython-39/spatial.o	d5f39760a1c27b76
