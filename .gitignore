@@ -2,3 +2,13 @@
 __pycache__
 encoders
 outputs
+
+# Python/CUDA build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+.ninja_*
+build.ninja
+*.py[cod]
