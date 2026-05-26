@@ -706,7 +706,9 @@ def set_features(dataset : ModelParams, opt : OptimizationParams, pipe : Pipelin
     gaussians.compact_feature_field.save_ply(os.path.join(point_cloud_path, "feature_field.ply"))
 
     # save gaussian data
-    with open(os.path.join(output_path,  f"train_before_merging/gaussian_data.txt"), 'w') as f:
+    train_before_merging_path = os.path.join(output_path, "train_before_merging")
+    makedirs(train_before_merging_path, exist_ok=True)
+    with open(os.path.join(train_before_merging_path, "gaussian_data.txt"), 'w') as f:
         f.write("number of gaussians: " + str(gaussians.get_num_gaussians) + "\n")
         f.write("number of compact feature gaussians: " + str(gaussians.compact_feature_field.get_num_gaussians) + "\n")
 
