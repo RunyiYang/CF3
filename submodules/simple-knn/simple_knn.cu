@@ -11,6 +11,8 @@
 
 #define BOX_SIZE 1024
 
+#include <cfloat>
+#include <cstdint>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "simple_knn.h"
@@ -766,6 +768,4 @@ void SimpleKNN::mergeKNN(
 
     cudaFree(result);
 }
-
-
 
