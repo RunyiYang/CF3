@@ -15,6 +15,7 @@ from time import perf_counter
 import numpy as np
 import torch
 import torch.nn.functional as F
+import cv2
 from PIL import Image, ImageDraw
 from tqdm import tqdm
 
@@ -38,6 +39,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene", type=str, required=True)
     parser.add_argument("--gt_folder", type=str, required=True)
     parser.add_argument("--mask_thresh", type=float, default=0.4)
+    parser.add_argument(
+        "--mask_protocol",
+        choices=("raw", "lerf"),
+        default="lerf",
+        help="raw thresholds relevance directly; lerf matches LangSplat/LERF smoothing and truncation.",
+    )
+    parser.add_argument(
+        "--loc_metric",
+        choices=("mask", "bbox"),
+        default="bbox",
+        help="bbox matches the LangSplat/LERF localization protocol.",
+    )
+    parser.add_argument(
+        "--normalize_decoded_features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="L2-normalize decoded 512D features before OpenCLIP relevance.",
+    )
+    parser.add_argument("--eval_subdir", type=str, default="eval_lerf_ovs")
     parser.add_argument("--metrics_tsv", type=str, default="")
     parser.add_argument("--per_object_tsv", type=str, default="")
     parser.add_argument("--quiet", action="store_true")
@@ -78,6 +98,20 @@ def polygon_mask(width: int, height: int, objects: list[dict]) -> np.ndarray:
     return np.asarray(mask_image, dtype=bool)
 
 
+def object_bboxes(objects: list[dict]) -> np.ndarray:
+    boxes = []
+    for obj in objects:
+        bbox = obj.get("bbox")
+        if bbox is None:
+            continue
+        bbox_arr = np.asarray(bbox, dtype=np.float32).reshape(-1)
+        if bbox_arr.size == 4:
+            boxes.append(bbox_arr)
+    if not boxes:
+        return np.empty((0, 4), dtype=np.float32)
+    return np.stack(boxes, axis=0)
+
+
 def resize_mask(mask: np.ndarray, height: int, width: int) -> np.ndarray:
     if mask.shape == (height, width):
         return mask
@@ -86,7 +120,18 @@ def resize_mask(mask: np.ndarray, height: int, width: int) -> np.ndarray:
     return np.asarray(mask_image, dtype=np.uint8) > 0
 
 
-def load_annotations(gt_folder: str) -> list[tuple[str, str, int, int, np.ndarray]]:
+def resize_bboxes(bboxes: np.ndarray, src_width: int, src_height: int, dst_width: int, dst_height: int) -> np.ndarray:
+    if bboxes.size == 0:
+        return bboxes
+    scale_x = dst_width / src_width
+    scale_y = dst_height / src_height
+    resized = bboxes.copy()
+    resized[:, [0, 2]] *= scale_x
+    resized[:, [1, 3]] *= scale_y
+    return resized
+
+
+def load_annotations(gt_folder: str) -> list[tuple[str, str, int, int, np.ndarray, np.ndarray]]:
     label_paths = sorted(Path(gt_folder).glob("*.json"))
     annotations = []
     for label_path in label_paths:
@@ -105,12 +150,19 @@ def load_annotations(gt_folder: str) -> list[tuple[str, str, int, int, np.ndarra
 
         for category, objects in sorted(by_category.items()):
             gt_mask = polygon_mask(width, height, objects)
-            annotations.append((image_stem, category, width, height, gt_mask))
+            bboxes = object_bboxes(objects)
+            annotations.append((image_stem, category, width, height, gt_mask, bboxes))
     return annotations
 
 
 @torch.no_grad()
-def render_feature_map(view, gaussians: GaussianModel, pipeline, background: torch.Tensor) -> torch.Tensor:
+def render_feature_map(
+    view,
+    gaussians: GaussianModel,
+    pipeline,
+    background: torch.Tensor,
+    normalize_decoded_features: bool,
+) -> torch.Tensor:
     gaussians.compact_feature_field.normalize_features()
     latent_features = gaussians.compact_feature_field.get_normalized_features.reshape(-1, 3)
     latent_map = render(
@@ -121,9 +173,74 @@ def render_feature_map(view, gaussians: GaussianModel, pipeline, background: tor
         override_color=latent_features,
     )["render"]
     feature_map = gaussians.compact_feature_field.decode_featuremap(latent_map).float()
-    feature_map = F.normalize(feature_map, p=2, dim=0)
+    if normalize_decoded_features:
+        feature_map = F.normalize(feature_map, p=2, dim=0)
     feature_map[torch.isnan(feature_map)] = 0.0
     return feature_map
+
+
+def average_filter_relevance(relevance_map: torch.Tensor, scale: int = 30) -> torch.Tensor:
+    np_relev = relevance_map.detach().cpu().numpy()
+    kernel = np.ones((scale, scale), dtype=np.float32) / float(scale**2)
+    avg_filtered = cv2.filter2D(np_relev, -1, kernel)
+    return torch.from_numpy(avg_filtered).to(relevance_map.device)
+
+
+def lerf_protocol_mask(relevance_map: torch.Tensor, mask_thresh: float) -> np.ndarray:
+    avg_filtered = average_filter_relevance(relevance_map)
+    filtered_map = 0.5 * (avg_filtered + relevance_map)
+
+    output = filtered_map - torch.min(filtered_map)
+    output = output / (torch.max(output) + 1e-9)
+    output = output * 2.0 - 1.0
+    output = torch.clip(output, 0, 1)
+
+    pred_mask = (output.detach().cpu().numpy() > mask_thresh).astype(np.uint8)
+    return smooth_mask(pred_mask).astype(bool)
+
+
+def smooth_mask(mask: np.ndarray) -> np.ndarray:
+    h, w = mask.shape[:2]
+    smoothed = mask.copy()
+    scale = 3
+    for i in range(h):
+        y0 = max(0, i - scale)
+        y1 = min(i + scale + 1, h - 1)
+        for j in range(w):
+            x0 = max(0, j - scale)
+            x1 = min(j + scale + 1, w - 1)
+            square = mask[y0:y1, x0:x1]
+            smoothed[i, j] = np.argmax(np.bincount(square.reshape(-1)))
+    return smoothed
+
+
+def locate_peaks(relevance_map: torch.Tensor, protocol: str) -> np.ndarray:
+    if protocol == "lerf":
+        loc_map = average_filter_relevance(relevance_map)
+    else:
+        loc_map = relevance_map
+    loc_np = loc_map.detach().cpu().numpy()
+    max_value = loc_np.max()
+    ys, xs = np.nonzero(loc_np == max_value)
+    return np.stack([xs, ys], axis=1)
+
+
+def any_point_in_bboxes(points_xy: np.ndarray, bboxes: np.ndarray) -> bool:
+    for x, y in points_xy:
+        for x1, y1, x2, y2 in bboxes.reshape(-1, 4):
+            x_min, x_max = min(x1, x2), max(x1, x2)
+            y_min, y_max = min(y1, y2), max(y1, y2)
+            if x_min <= x <= x_max and y_min <= y <= y_max:
+                return True
+    return False
+
+
+def any_point_in_mask(points_xy: np.ndarray, mask: np.ndarray) -> bool:
+    height, width = mask.shape
+    for x, y in points_xy:
+        if 0 <= x < width and 0 <= y < height and mask[y, x]:
+            return True
+    return False
 
 
 def evaluate(args: argparse.Namespace) -> tuple[dict, list[dict]]:
@@ -146,7 +263,7 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[dict]]:
 
     device = torch.device("cuda")
     clip_model = OpenCLIPNetwork(device)
-    eval_dir = Path(dataset.model_path) / "eval_lerf_ovs"
+    eval_dir = Path(dataset.model_path) / args.eval_subdir
     eval_dir.mkdir(parents=True, exist_ok=True)
     if args.save_masks:
         (eval_dir / "masks").mkdir(exist_ok=True)
@@ -159,7 +276,7 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[dict]]:
     render_cache: dict[str, torch.Tensor] = {}
     start = perf_counter()
 
-    for image_stem, category, gt_width, gt_height, gt_mask in tqdm(annotations, desc=f"Eval {args.scene}"):
+    for image_stem, category, gt_width, gt_height, gt_mask, gt_bboxes in tqdm(annotations, desc=f"Eval {args.scene}"):
         view = views.get(image_stem)
         if view is None:
             per_object_rows.append(
@@ -171,6 +288,8 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[dict]]:
                     "loc_acc": "nan",
                     "pred_px": "nan",
                     "gt_px": int(gt_mask.sum()),
+                    "peak_x": "nan",
+                    "peak_y": "nan",
                     "max_relevance": "nan",
                     "mean_relevance": "nan",
                     "status": "missing_view",
@@ -179,23 +298,36 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[dict]]:
             continue
 
         if image_stem not in render_cache:
-            render_cache[image_stem] = render_feature_map(view, gaussians, args.pipeline, background)
+            render_cache[image_stem] = render_feature_map(
+                view,
+                gaussians,
+                args.pipeline,
+                background,
+                normalize_decoded_features=args.normalize_decoded_features,
+            )
         feature_map = render_cache[image_stem]
         _, height, width = feature_map.shape
         gt_mask_eval = resize_mask(gt_mask, height, width)
+        gt_bboxes_eval = resize_bboxes(gt_bboxes, gt_width, gt_height, width, height)
 
         clip_model.set_positives([category])
         sem_map = feature_map.permute(1, 2, 0).unsqueeze(0)
         relevance_map = clip_model.get_max_across(sem_map)[0, 0].detach().float()
-        pred_mask = (relevance_map > args.mask_thresh).cpu().numpy().astype(bool)
+        if args.mask_protocol == "lerf":
+            pred_mask = lerf_protocol_mask(relevance_map, args.mask_thresh)
+        else:
+            pred_mask = (relevance_map > args.mask_thresh).cpu().numpy().astype(bool)
 
         intersection = np.logical_and(pred_mask, gt_mask_eval).sum()
         union = np.logical_or(pred_mask, gt_mask_eval).sum()
         iou = float(intersection / union) if union > 0 else 0.0
 
-        max_index = int(torch.argmax(relevance_map).item())
-        max_y, max_x = divmod(max_index, width)
-        loc_acc = bool(gt_mask_eval[max_y, max_x])
+        peak_points = locate_peaks(relevance_map, args.mask_protocol)
+        max_x, max_y = peak_points[0]
+        if args.loc_metric == "bbox":
+            loc_acc = any_point_in_bboxes(peak_points, gt_bboxes_eval)
+        else:
+            loc_acc = any_point_in_mask(peak_points, gt_mask_eval)
 
         ious.append(iou)
         loc_hits.append(float(loc_acc))
@@ -207,6 +339,8 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[dict]]:
             "loc_acc": int(loc_acc),
             "pred_px": int(pred_mask.sum()),
             "gt_px": int(gt_mask_eval.sum()),
+            "peak_x": max_x,
+            "peak_y": max_y,
             "max_relevance": f"{float(relevance_map.max().item()):.6f}",
             "mean_relevance": f"{float(relevance_map.mean().item()):.6f}",
             "status": "ok",
@@ -229,6 +363,9 @@ def evaluate(args: argparse.Namespace) -> tuple[dict, list[dict]]:
         "num_frames": len({row["frame"] for row in per_object_rows if row["status"] == "ok"}),
         "num_queries": len(ious),
         "mask_thresh": args.mask_thresh,
+        "mask_protocol": args.mask_protocol,
+        "loc_metric": args.loc_metric,
+        "normalize_decoded_features": args.normalize_decoded_features,
         "iteration": args.iteration,
         "model_path": dataset.model_path,
         "elapsed_sec": elapsed,
@@ -249,7 +386,7 @@ def main() -> None:
     args = parse_args()
     metrics, per_object_rows = evaluate(args)
 
-    eval_dir = Path(args.dataset.model_path) / "eval_lerf_ovs"
+    eval_dir = Path(args.dataset.model_path) / args.eval_subdir
     metrics_path = Path(args.metrics_tsv) if args.metrics_tsv else eval_dir / "metrics.tsv"
     per_object_path = Path(args.per_object_tsv) if args.per_object_tsv else eval_dir / "per_object_metrics.tsv"
 
@@ -260,6 +397,9 @@ def main() -> None:
         "num_frames",
         "num_queries",
         "mask_thresh",
+        "mask_protocol",
+        "loc_metric",
+        "normalize_decoded_features",
         "iteration",
         "model_path",
         "elapsed_sec",
@@ -287,6 +427,8 @@ def main() -> None:
             "loc_acc",
             "pred_px",
             "gt_px",
+            "peak_x",
+            "peak_y",
             "max_relevance",
             "mean_relevance",
             "status",
